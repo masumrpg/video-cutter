@@ -124,17 +124,36 @@ class VideoProcessor(QThread):
             return 'libx264', 'auto'
 
     def parse_ffmpeg_progress(self, line):
-        """Parse FFmpeg output for real-time progress"""
-        # Look for time=XX:XX:XX.XX pattern
-        time_match = re.search(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})', line)
+        """Parse FFmpeg output for real-time progress.
+
+        Supports default stderr progress (time=HH:MM:SS.xx) and
+        -progress pipe:1 output (out_time=HH:MM:SS.xx or out_time_ms=...).
+        """
+        # -progress fields
+        out_time_match = re.search(r'out_time=(\d{2}):(\d{2}):(\d{2})\.(\d+)', line)
+        if out_time_match:
+            hours = int(out_time_match.group(1))
+            minutes = int(out_time_match.group(2))
+            seconds = int(out_time_match.group(3))
+            frac = out_time_match.group(4)
+            frac_seconds = float(f"0.{frac}")
+            return hours * 3600 + minutes * 60 + seconds + frac_seconds
+
+        out_time_ms_match = re.search(r'out_time_ms=(\d+)', line)
+        if out_time_ms_match:
+            val = int(out_time_ms_match.group(1))
+            # Heuristic: treat values >= 1e6 as microseconds, else milliseconds
+            return val / (1_000_000.0 if val >= 1_000_000 else 1_000.0)
+
+        # Default console progress lines
+        time_match = re.search(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d+)', line)
         if time_match:
             hours = int(time_match.group(1))
             minutes = int(time_match.group(2))
             seconds = int(time_match.group(3))
-            milliseconds = int(time_match.group(4))
-
-            current_time = hours * 3600 + minutes * 60 + seconds + milliseconds / 100
-            return current_time
+            frac = time_match.group(4)
+            frac_seconds = float(f"0.{frac}")
+            return hours * 3600 + minutes * 60 + seconds + frac_seconds
         return None
 
     def pause_processing(self):
@@ -260,15 +279,20 @@ class VideoProcessor(QThread):
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # Merge stderr to avoid deadlocks on full buffers
                 universal_newlines=True,
                 bufsize=1
             )
 
             current_progress = 0
+            collected_output = []  # Keep recent output for error diagnostics
 
             # Read FFmpeg output line by line
             for line in iter(self.process.stdout.readline, ''):
+                if line:
+                    collected_output.append(line.rstrip())
+                    if len(collected_output) > 500:
+                        collected_output.pop(0)
                 # Check for cancellation
                 if self.is_cancelled:
                     break
@@ -311,7 +335,7 @@ class VideoProcessor(QThread):
 
             # Wait for process to complete if not cancelled
             if not self.is_cancelled:
-                stdout, stderr = self.process.communicate()
+                self.process.wait()
 
                 if self.process.returncode == 0:
                     self.progress_updated.emit(100)
@@ -320,8 +344,9 @@ class VideoProcessor(QThread):
                     self.finished.emit(True, "Video processed successfully!")
                 else:
                     error_msg = f"FFmpeg failed with return code {self.process.returncode}"
-                    if stderr:
-                        error_msg += f"\nError: {stderr}"
+                    if collected_output:
+                        tail = "\n".join(collected_output[-50:])
+                        error_msg += f"\nOutput tail:\n{tail}"
                     print(f"FFmpeg error: {error_msg}")
                     self.finished.emit(False, error_msg)
             else:
@@ -347,9 +372,9 @@ class VideoInfoWidget(QWidget):
         layout = QVBoxLayout()
 
         # Title
-        title = QLabel("📊 Video Information")
-        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50; margin-bottom: 10px;")
-        layout.addWidget(title)
+        self.title = QLabel("📊 Video Information")
+        self.title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50; margin-bottom: 10px;")
+        layout.addWidget(self.title)
 
         # Info display
         self.info_text = QTextEdit()
@@ -368,6 +393,34 @@ class VideoInfoWidget(QWidget):
         layout.addWidget(self.info_text)
 
         self.setLayout(layout)
+
+    def set_theme(self, dark: bool):
+        """Apply light/dark theme to this widget."""
+        if dark:
+            self.title.setStyleSheet("font-size: 16px; font-weight: bold; color: #ecf0f1; margin-bottom: 10px;")
+            self.info_text.setStyleSheet("""
+                QTextEdit {
+                    background-color: #2b2b2b;
+                    color: #e6e6e6;
+                    border: 1px solid #3a3a3a;
+                    border-radius: 8px;
+                    padding: 10px;
+                    font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+                    font-size: 12px;
+                }
+            """)
+        else:
+            self.title.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50; margin-bottom: 10px;")
+            self.info_text.setStyleSheet("""
+                QTextEdit {
+                    background-color: #f8f9fa;
+                    border: 1px solid #dee2e6;
+                    border-radius: 8px;
+                    padding: 10px;
+                    font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+                    font-size: 12px;
+                }
+            """)
 
     def update_info(self, video_path):
         try:
@@ -413,9 +466,14 @@ class DropZone(QLabel):
 
     def __init__(self):
         super().__init__()
+        self._dark = False
         self.setAcceptDrops(True)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumHeight(120)
+        self.apply_light_style()
+        self.setText("🎬 Drag & Drop Video Files Here\n\nOr click 'Browse Files' button below")
+
+    def apply_light_style(self):
         self.setStyleSheet("""
             QLabel {
                 border: 3px dashed #3498db;
@@ -430,33 +488,61 @@ class DropZone(QLabel):
                 border-color: #2980b9;
             }
         """)
-        self.setText("🎬 Drag & Drop Video Files Here\n\nOr click 'Browse Files' button below")
+
+    def apply_dark_style(self):
+        self.setStyleSheet("""
+            QLabel {
+                border: 3px dashed #5dade2;
+                border-radius: 15px;
+                background-color: #2b2b2b;
+                color: #e6e6e6;
+                font-size: 14px;
+                padding: 20px;
+            }
+            QLabel:hover {
+                background-color: #3a3a3a;
+                border-color: #3498db;
+            }
+        """)
+
+    def set_theme(self, dark: bool):
+        self._dark = dark
+        if dark:
+            self.apply_dark_style()
+        else:
+            self.apply_light_style()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
-            self.setStyleSheet("""
-                QLabel {
-                    border: 3px dashed #27ae60;
-                    border-radius: 15px;
-                    background-color: #d5f4e6;
-                    color: #2c3e50;
-                    font-size: 14px;
-                    padding: 20px;
-                }
-            """)
+            if self._dark:
+                self.setStyleSheet("""
+                    QLabel {
+                        border: 3px dashed #27ae60;
+                        border-radius: 15px;
+                        background-color: #244a3a;
+                        color: #e6e6e6;
+                        font-size: 14px;
+                        padding: 20px;
+                    }
+                """)
+            else:
+                self.setStyleSheet("""
+                    QLabel {
+                        border: 3px dashed #27ae60;
+                        border-radius: 15px;
+                        background-color: #d5f4e6;
+                        color: #2c3e50;
+                        font-size: 14px;
+                        padding: 20px;
+                    }
+                """)
 
     def dragLeaveEvent(self, event):
-        self.setStyleSheet("""
-            QLabel {
-                border: 3px dashed #3498db;
-                border-radius: 15px;
-                background-color: #ecf0f1;
-                color: #2c3e50;
-                font-size: 14px;
-                padding: 20px;
-            }
-        """)
+        if self._dark:
+            self.apply_dark_style()
+        else:
+            self.apply_light_style()
 
     def dropEvent(self, event):
         files = []
@@ -469,16 +555,10 @@ class DropZone(QLabel):
             self.files_dropped.emit(files)
             self.setText(f"✅ {len(files)} file(s) selected")
 
-        self.setStyleSheet("""
-            QLabel {
-                border: 3px dashed #3498db;
-                border-radius: 15px;
-                background-color: #ecf0f1;
-                color: #2c3e50;
-                font-size: 14px;
-                padding: 20px;
-            }
-        """)
+        if self._dark:
+            self.apply_dark_style()
+        else:
+            self.apply_light_style()
 
 class VideoIntervalCutter(QMainWindow):
     def __init__(self):
@@ -486,11 +566,14 @@ class VideoIntervalCutter(QMainWindow):
         self.selected_files = []
         self.current_processing = 0
         self.dark_mode = False
+        self._applying_theme = False
         self.output_directory = ""
         self.processor = None
         self.is_processing = False
         self.is_paused = False
         self.init_ui()
+        # Apply system theme and listen for changes (macOS auto dark mode)
+        self.setup_auto_theme()
 
     def init_ui(self):
         self.setWindowTitle("🎬 FFmpeg Video Interval Cutter Pro")
@@ -806,6 +889,76 @@ class VideoIntervalCutter(QMainWindow):
         # Update preview
         self.update_preview()
 
+    def setup_auto_theme(self):
+        """Detect system theme and react to theme changes."""
+        app = QApplication.instance()
+        dark = self.detect_system_dark_mode()
+        self.apply_theme(dark)
+        # Connect to colorScheme changes if available (Qt 6.5+)
+        try:
+            hints = app.styleHints()
+            if hasattr(hints, 'colorSchemeChanged'):
+                hints.colorSchemeChanged.connect(lambda scheme: self.apply_theme(scheme == Qt.ColorScheme.Dark))
+        except Exception:
+            pass
+        # No global event filter to avoid recursion; use changeEvent instead
+
+    def detect_system_dark_mode(self) -> bool:
+        """Best-effort detection of system dark mode."""
+        try:
+            hints = QApplication.instance().styleHints()
+            if hasattr(hints, 'colorScheme'):
+                return hints.colorScheme() == Qt.ColorScheme.Dark
+        except Exception:
+            pass
+        # Fallback: infer from palette lightness
+        pal = QApplication.instance().palette()
+        win = pal.color(QPalette.ColorRole.Window)
+        return win.lightness() < 128
+
+    def changeEvent(self, event):
+        # Respond to palette/theme/style changes on this window
+        if event.type() in (QEvent.Type.ApplicationPaletteChange, QEvent.Type.PaletteChange, QEvent.Type.StyleChange):
+            if not self._applying_theme:
+                self.apply_theme(self.detect_system_dark_mode())
+        super().changeEvent(event)
+
+    def apply_theme(self, dark: bool):
+        """Apply dark or light theme across the UI."""
+        if self._applying_theme:
+            return
+        self._applying_theme = True
+        try:
+            self.dark_mode = dark
+            if dark:
+                # Base backgrounds and text
+                self.setStyleSheet("""
+                    QMainWindow, QWidget { background-color: #1e1e1e; color: #e6e6e6; }
+                    QGroupBox { border: 2px solid #4f4f4f; color: #e6e6e6; border-radius: 8px; margin-top: 8px; }
+                    QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px 0 3px; }
+                    QLineEdit, QSpinBox, QComboBox, QListWidget {
+                        background-color: #2b2b2b; color: #e6e6e6; border: 1px solid #3a3a3a; border-radius: 6px;
+                    }
+                """)
+                # Labels
+                self.cycle_info.setStyleSheet("color: #b0b0b0; font-style: italic;")
+                self.time_info_label.setStyleSheet("color: #b0b0b0; font-family: Monaco, monospace; font-size: 12px;")
+                self.status_label.setStyleSheet("color: #b0b0b0; font-style: italic;")
+                self.current_file_label.setStyleSheet("color: #e6e6e6; font-size: 12px; font-weight: bold;")
+            else:
+                # Reset to light defaults close to original styling
+                self.setStyleSheet("")
+                self.cycle_info.setStyleSheet("color: #7f8c8d; font-style: italic;")
+                self.time_info_label.setStyleSheet("color: #7f8c8d; font-family: Monaco, monospace; font-size: 12px;")
+                self.status_label.setStyleSheet("color: #7f8c8d; font-style: italic;")
+                self.current_file_label.setStyleSheet("color: #34495e; font-size: 12px; font-weight: bold;")
+
+            # Per-widget theme updates
+            self.video_info.set_theme(dark)
+            self.drop_zone.set_theme(dark)
+        finally:
+            self._applying_theme = False
+
     def create_menu_bar(self):
         menubar = self.menuBar()
 
@@ -1014,24 +1167,8 @@ class VideoIntervalCutter(QMainWindow):
         QTimer.singleShot(2000, self.process_next_file)
 
     def toggle_dark_mode(self):
-        self.dark_mode = not self.dark_mode
-        if self.dark_mode:
-            self.setStyleSheet("""
-                QMainWindow {
-                    background-color: #2c3e50;
-                    color: #ecf0f1;
-                }
-                QWidget {
-                    background-color: #2c3e50;
-                    color: #ecf0f1;
-                }
-                QGroupBox {
-                    border: 2px solid #7f8c8d;
-                    color: #ecf0f1;
-                }
-            """)
-        else:
-            self.setStyleSheet("")
+        # Manual toggle (inverts current theme)
+        self.apply_theme(not self.dark_mode)
 
     def show_about(self):
         QMessageBox.about(self, "About", """
